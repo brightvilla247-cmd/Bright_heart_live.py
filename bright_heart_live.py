@@ -58,6 +58,15 @@ last_diagnostic = {}
 tick_counts = {pair: 0 for pair in PAIRS}
 feed_status = {pair: "WAITING" for pair in PAIRS}
 
+discord_status = {
+    "configured": bool(WEBHOOK_URL),
+    "last_test": None,
+    "last_delivery": None,
+    "last_error": None
+}
+
+discord_lock = threading.Lock()
+
 # ==========================================
 # RENDER HEALTH SERVER
 # ==========================================
@@ -73,7 +82,12 @@ def home():
         "market_feed": "Biquote SignalR",
         "historical_data": "Biquote 1m OHLC",
         "pairs": PAIRS,
-        "timeframes": ["15s", "30s", "1m"]
+        "timeframes": ["15s", "30s", "1m"],
+        "discord": (
+            "CONFIGURED" if WEBHOOK_URL
+            else "NOT CONFIGURED"
+        ),
+        "discord_last_test": discord_status["last_test"]
     })
 
 
@@ -131,7 +145,13 @@ def status():
     return jsonify({
         "service": APP_NAME,
         "status": "running",
-        "pairs": result
+        "pairs": result,
+        "discord": (
+            "CONFIGURED" if WEBHOOK_URL
+            else "NOT CONFIGURED"
+        ),
+        "discord_last_test": discord_status["last_test"],
+        "discord_last_delivery": discord_status["last_delivery"]
     })
 
 
@@ -159,6 +179,116 @@ def readiness():
     })
 
 
+# ==========================================
+# DISCORD
+# ==========================================
+
+def send_discord(message):
+    if not WEBHOOK_URL:
+        print("[DISCORD] NOT CONFIGURED")
+        discord_status["last_error"] = "Webhook missing"
+        return False
+
+    try:
+        response = requests.post(
+            WEBHOOK_URL,
+            json={
+                "username": APP_NAME,
+                "content": message
+            },
+            timeout=15
+        )
+
+        if response.status_code in (200, 204):
+            print("[DISCORD] MESSAGE DELIVERED")
+
+            discord_status["last_delivery"] = (
+                datetime.now(WAT).strftime("%Y-%m-%d %H:%M:%S WAT")
+            )
+            discord_status["last_error"] = None
+
+            return True
+
+        error = (
+            f"HTTP {response.status_code}: "
+            f"{response.text[:200]}"
+        )
+
+        print("[DISCORD] DELIVERY FAILED:", error)
+        discord_status["last_error"] = error
+
+        return False
+
+    except Exception as error:
+        print("[DISCORD] CONNECTION ERROR:", str(error)[:300])
+        discord_status["last_error"] = str(error)[:300]
+        return False
+
+
+def discord_startup_test():
+    if not WEBHOOK_URL:
+        print("[DISCORD TEST] FAILED - WEBHOOK NOT CONFIGURED")
+        discord_status["last_test"] = "NOT CONFIGURED"
+        return False
+
+    print("[DISCORD TEST] SENDING STARTUP TEST...")
+
+    message = (
+        "BRIGHT HEART AI\n"
+        "Discord connection test\n"
+        "Webhook delivery test successful.\n"
+        "Market analysis is starting."
+    )
+
+    success = send_discord(message)
+
+    if success:
+        discord_status["last_test"] = "SUCCESS"
+        print("[DISCORD TEST] SUCCESS - CHECK YOUR CHANNEL")
+    else:
+        discord_status["last_test"] = "FAILED"
+        print("[DISCORD TEST] FAILED - CHECK DELIVERY ERROR")
+
+    return success
+
+
+@app.route("/discord-test", methods=["GET"])
+def discord_test():
+    if not WEBHOOK_URL:
+        return jsonify({
+            "success": False,
+            "message": "Discord webhook is not configured"
+        }), 503
+
+    message = (
+        "BRIGHT HEART AI\n"
+        "Manual Discord delivery test successful.\n"
+        "Your webhook is responding."
+    )
+
+    success = send_discord(message)
+
+    discord_status["last_test"] = (
+        "SUCCESS" if success else "FAILED"
+    )
+
+    if success:
+        return jsonify({
+            "success": True,
+            "message": "Test message delivered to Discord"
+        })
+
+    return jsonify({
+        "success": False,
+        "message": "Discord delivery failed",
+        "error": discord_status["last_error"]
+    }), 502
+
+
+# ==========================================
+# RENDER SERVER
+# ==========================================
+
 def start_web_server():
     port = int(os.environ.get("PORT", 10000))
     print("Starting health server on port", port)
@@ -179,10 +309,7 @@ def feed_monitor():
 
                 feed_status[pair] = state
 
-                if age is None:
-                    age_text = "NO QUOTE"
-                else:
-                    age_text = f"{age}s"
+                age_text = "NO QUOTE" if age is None else f"{age}s"
 
                 print(
                     f"{pair}: {state} | "
@@ -298,9 +425,7 @@ def seed_historical_1m():
 
                 closed_bars.append(candle)
 
-            closed_bars.sort(
-                key=lambda item: item["start"]
-            )
+            closed_bars.sort(key=lambda item: item["start"])
 
             history[pair][60].clear()
 
@@ -321,38 +446,6 @@ def seed_historical_1m():
 
     print("HISTORICAL DATA LOADING FINISHED")
     print("====================================\n")
-
-
-# ==========================================
-# DISCORD
-# ==========================================
-
-def send_discord(message):
-    if not WEBHOOK_URL:
-        print("DISCORD NOT CONFIGURED")
-        return False
-
-    try:
-        response = requests.post(
-            WEBHOOK_URL,
-            json={
-                "username": APP_NAME,
-                "content": message
-            },
-            timeout=15
-        )
-
-        if response.status_code in (200, 204):
-            print("DISCORD ALERT SENT")
-            return True
-
-        print("DISCORD ERROR:", response.status_code)
-        print(response.text[:300])
-        return False
-
-    except Exception as error:
-        print("DISCORD CONNECTION ERROR:", error)
-        return False
 
 
 # ==========================================
@@ -391,7 +484,6 @@ def get_analysis(pair, seconds):
 # ==========================================
 
 def evaluate_signal(pair, now):
-
     quote = latest_quotes.get(pair)
 
     if not quote:
@@ -424,7 +516,6 @@ def evaluate_signal(pair, now):
         diagnostic(pair, "WAIT - COLLECTING REQUIRED CANDLES")
         return
 
-    # Verify candle freshness
     for seconds, analysis in analyses.items():
         candle_close = analysis["time"] + seconds
         age = now.timestamp() - candle_close
@@ -461,7 +552,6 @@ def evaluate_signal(pair, now):
 
     direction = "BUY" if buy_conditions else "SELL"
 
-    # Setup strength is NOT win probability
     separations = [
         abs(a["fast"] - a["slow"]) / pip
         for a in analyses.values()
@@ -575,7 +665,6 @@ def process_tick(tick):
         feed_status[pair] = "LIVE"
 
         for seconds in TIMEFRAMES:
-
             bucket = (
                 int(timestamp.timestamp()) // seconds
             ) * seconds
@@ -594,7 +683,6 @@ def process_tick(tick):
                 continue
 
             if bucket < candle["start"]:
-                # Ignore out-of-order tick
                 continue
 
             if bucket == candle["start"]:
@@ -603,17 +691,11 @@ def process_tick(tick):
                 candle["close"] = mid
 
             elif bucket > candle["start"]:
-
                 expected_next = candle["start"] + seconds
 
                 if bucket == expected_next:
-                    # Normal completed candle
                     history[pair][seconds].append(candle)
-
                 else:
-                    # GAP RECOVERY:
-                    # Do not invent missing prices.
-                    # Discard incomplete candle and restart.
                     diagnostic(
                         pair,
                         f"{seconds}s CANDLE GAP - RECOVERING"
@@ -667,7 +749,6 @@ async def receive_state(data):
 # ==========================================
 
 async def run_market_feed():
-
     while True:
         try:
             print("Connecting to Biquote live market feed...")
@@ -677,11 +758,7 @@ async def run_market_feed():
             )
 
             client.on("ReceiveTick", receive_tick)
-
-            client.on(
-                "ReceiveSubscriptionState",
-                receive_state
-            )
+            client.on("ReceiveSubscriptionState", receive_state)
 
             client.on_open(
                 lambda: client.send("Subscribe", [PAIRS])
@@ -703,7 +780,6 @@ async def run_market_feed():
 # ==========================================
 
 async def main():
-
     print("===================================")
     print(APP_NAME, "- RENDER CLOUD")
     print("PAIRS:", ", ".join(PAIRS))
@@ -712,17 +788,21 @@ async def main():
     print("HISTORICAL: BIQUOTE 1M OHLC")
     print("FEED MONITOR: ENABLED")
     print("GAP RECOVERY: ENABLED")
-    print("DISCORD:", "CONFIGURED" if WEBHOOK_URL else "NOT CONFIGURED")
+    print(
+        "DISCORD:",
+        "CONFIGURED" if WEBHOOK_URL else "NOT CONFIGURED"
+    )
     print("OTC: NOT ENABLED")
     print("===================================")
 
-    # Start live feed monitor
+    # Send one startup delivery test
+    discord_startup_test()
+
     threading.Thread(
         target=feed_monitor,
         daemon=True
     ).start()
 
-    # Load historical one-minute candles
     await asyncio.to_thread(seed_historical_1m)
 
     print("Starting live market analysis...")
@@ -730,12 +810,3 @@ async def main():
 
     await run_market_feed()
 
-
-if __name__ == "__main__":
-
-    threading.Thread(
-        target=start_web_server,
-        daemon=True
-    ).start()
-
-    asyncio.run(main())
