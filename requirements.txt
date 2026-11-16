@@ -2,4 +2,7 @@
 pysignalr
 requests
 pytz
+flask
+waitress
+
 
