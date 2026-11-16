@@ -14,14 +14,13 @@ from waitress import serve
 from pysignalr.client import SignalRClient
 
 
-# =========================================================
+# =====================================================
 # BRIGHT HEART AI - LIVE FOREX SIGNALS
-# =========================================================
+# =====================================================
 
 APP_NAME = "BRIGHT HEART AI"
-
-BIQUOTE_HUB = "https://biquote.io/hubs/tick"
 BIQUOTE_URL = "https://biquote.io"
+BIQUOTE_HUB = "https://biquote.io/hubs/tick"
 
 WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 
@@ -30,7 +29,6 @@ TIMEFRAMES = [15, 30, 60]
 
 EMA_FAST = 9
 EMA_SLOW = 21
-
 MAX_SPREAD_PIPS = 2.0
 MIN_CONFIDENCE = 70
 ALERT_COOLDOWN_SECONDS = 300
@@ -40,10 +38,6 @@ LIVE_MAX_AGE = 5
 STALE_MAX_AGE = 15
 
 WAT = pytz.timezone("Africa/Lagos")
-
-# =========================================================
-# GLOBAL STATE
-# =========================================================
 
 app = Flask(__name__)
 
@@ -61,7 +55,6 @@ last_alert = {}
 last_diagnostic = {}
 
 tick_counts = {pair: 0 for pair in PAIRS}
-feed_status = {pair: "WAITING" for pair in PAIRS}
 
 discord_status = {
     "configured": bool(WEBHOOK_URL),
@@ -72,12 +65,63 @@ discord_status = {
 state_lock = threading.Lock()
 
 
-# =========================================================
-# TIME AND PRICE HELPERS
-# =========================================================
+# =====================================================
+# TIME HELPERS
+# =====================================================
 
 def wat_now():
     return datetime.now(timezone.utc).astimezone(WAT)
+
+
+def parse_timestamp(value):
+    """
+    Supports:
+    - Unix seconds
+    - Unix milliseconds
+    - ISO timestamps such as 2026-11-16T22:58:01Z
+    """
+
+    if value is None or value == "":
+        return time.time()
+
+    if isinstance(value, (int, float)):
+        timestamp = float(value)
+
+        if timestamp > 100000000000:
+            timestamp /= 1000
+
+        return timestamp
+
+    value = str(value).strip()
+
+    # First try numeric timestamp.
+    try:
+        timestamp = float(value)
+
+        if timestamp > 100000000000:
+            timestamp /= 1000
+
+        return timestamp
+
+    except ValueError:
+        pass
+
+    # Then try ISO date/time.
+    try:
+        iso_value = value.replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(iso_value)
+
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+
+        return parsed.timestamp()
+
+    except Exception as error:
+        print(
+            f"[TIMESTAMP ERROR] Invalid timestamp {value!r}: {error}",
+            flush=True
+        )
+        return time.time()
 
 
 def pip_size(pair):
@@ -110,14 +154,14 @@ def diagnostic(pair, reason):
         last_diagnostic[key] = now
 
 
-# =========================================================
+# =====================================================
 # DISCORD
-# =========================================================
+# =====================================================
 
 def send_discord(message):
     if not WEBHOOK_URL:
-        print("[DISCORD] Webhook is not configured.", flush=True)
         discord_status["last_error"] = "Webhook not configured"
+        print("[DISCORD] Webhook not configured.", flush=True)
         return False
 
     try:
@@ -149,23 +193,20 @@ def send_discord(message):
 
 def discord_startup_test():
     if not WEBHOOK_URL:
-        print("[DISCORD] Not configured. Add DISCORD_WEBHOOK_URL in Render.", flush=True)
+        print("[DISCORD] Not configured.", flush=True)
         return
 
-    message = (
+    send_discord(
         "🟢 **BRIGHT HEART AI ONLINE**\n"
-        "Forex signal service has started.\n"
-        "Monitoring: EURUSD, GBPUSD, USDJPY, AUDUSD, USDCAD\n"
-        "Timeframes: 15s | 30s | 1m\n"
-        "Signal alerts are enabled."
+        "Live forex signal service has started.\n"
+        "Pairs: EURUSD, GBPUSD, USDJPY, AUDUSD, USDCAD\n"
+        "Timeframes: 15s | 30s | 1m"
     )
 
-    send_discord(message)
 
-
-# =========================================================
+# =====================================================
 # EMA AND ATR
-# =========================================================
+# =====================================================
 
 def ema(values, period):
     if len(values) < period:
@@ -204,16 +245,19 @@ def calculate_atr(candles, period=14):
     return sum(ranges[-period:]) / period
 
 
-# =========================================================
-# HISTORICAL 1-MINUTE CANDLES
-# =========================================================
+# =====================================================
+# HISTORICAL CANDLES
+# =====================================================
 
 def seed_historical_1m():
-    print("[HISTORY] Loading historical 1-minute candles...", flush=True)
+    print("[HISTORY] Loading historical candles...", flush=True)
 
     for pair in PAIRS:
         try:
-            url = f"{BIQUOTE_URL}/api/{pair}/ohlc?interval=1m&limit=100"
+            url = (
+                f"{BIQUOTE_URL}/api/{pair}/ohlc"
+                "?interval=1m&limit=100"
+            )
 
             response = requests.get(url, timeout=15)
             response.raise_for_status()
@@ -228,7 +272,7 @@ def seed_historical_1m():
                     continue
 
                 candle = {
-                    "time": float(bar["openTime"]),
+                    "time": parse_timestamp(bar.get("openTime")),
                     "open": float(bar["open"]),
                     "high": float(bar["high"]),
                     "low": float(bar["low"]),
@@ -239,7 +283,7 @@ def seed_historical_1m():
                 loaded += 1
 
             print(
-                f"[HISTORY] {pair}: loaded {loaded} closed 1m candles",
+                f"[HISTORY] {pair}: {loaded} candles loaded",
                 flush=True
             )
 
@@ -247,9 +291,9 @@ def seed_historical_1m():
             print(f"[HISTORY ERROR] {pair}: {error}", flush=True)
 
 
-# =========================================================
-# CANDLE BUILDING
-# =========================================================
+# =====================================================
+# CANDLE BUILDER
+# =====================================================
 
 def update_candle(pair, seconds, price, timestamp):
     bucket = int(timestamp // seconds) * seconds
@@ -285,7 +329,6 @@ def update_candle(pair, seconds, price, timestamp):
             "close": price
         }
 
-        # Do not manufacture missing candles.
         if bucket - completed["time"] != seconds:
             diagnostic(pair, f"{seconds}s candle gap detected")
             return False
@@ -295,9 +338,9 @@ def update_candle(pair, seconds, price, timestamp):
     return False
 
 
-# =========================================================
-# MARKET ANALYSIS
-# =========================================================
+# =====================================================
+# ANALYSIS
+# =====================================================
 
 def get_analysis(pair, seconds):
     candles = list(history[pair][seconds])
@@ -341,7 +384,6 @@ def evaluate_signal(pair, now):
 
     bid = quote["bid"]
     ask = quote["ask"]
-    mid = quote["mid"]
 
     spread = ask - bid
     pip = pip_size(pair)
@@ -357,7 +399,7 @@ def evaluate_signal(pair, now):
         analysis = get_analysis(pair, seconds)
 
         if analysis is None:
-            diagnostic(pair, f"Waiting for enough {seconds}s candles")
+            diagnostic(pair, f"Waiting for {seconds}s candles")
             return
 
         candle_age = now - (analysis["time"] + seconds)
@@ -395,7 +437,7 @@ def evaluate_signal(pair, now):
     elif sell_alignment:
         direction = "SELL"
     else:
-        diagnostic(pair, "EMA/timeframe confirmation not aligned")
+        diagnostic(pair, "Timeframe confirmation not aligned")
         return
 
     separations = [
@@ -403,7 +445,7 @@ def evaluate_signal(pair, now):
         for a in analyses.values()
     ]
 
-    # This is a setup-strength score, not a win probability.
+    # Setup-strength estimate, NOT win probability.
     confidence = min(
         90,
         70 + int(min(10, sum(separations) / 3 * 2))
@@ -414,14 +456,12 @@ def evaluate_signal(pair, now):
         return
 
     alert_key = (pair, direction)
-    last_time = last_alert.get(alert_key, 0)
 
-    if time.time() - last_time < ALERT_COOLDOWN_SECONDS:
+    if time.time() - last_alert.get(alert_key, 0) < ALERT_COOLDOWN_SECONDS:
         diagnostic(pair, "Alert cooldown active")
         return
 
-    one_minute_candles = list(history[pair][60])
-    atr = calculate_atr(one_minute_candles)
+    atr = calculate_atr(list(history[pair][60]))
 
     if atr is None or atr <= 0:
         diagnostic(pair, "Waiting for ATR data")
@@ -432,13 +472,15 @@ def evaluate_signal(pair, now):
     if direction == "BUY":
         entry = ask
         stop_loss = entry - risk_distance
-        take_profit = entry + (risk_distance * 2)
+        take_profit = entry + risk_distance * 2
     else:
         entry = bid
         stop_loss = entry + risk_distance
-        take_profit = entry - (risk_distance * 2)
+        take_profit = entry - risk_distance * 2
 
     entry_time = wat_now().strftime("%Y-%m-%d %H:%M:%S WAT")
+
+    decimals = 3 if "JPY" in pair else 5
 
     message = (
         f"📊 **{APP_NAME} - FOREX SIGNAL**\n"
@@ -446,9 +488,9 @@ def evaluate_signal(pair, now):
         f"**PAIR:** {pair}\n"
         f"**DIRECTION:** {'🟢 BUY' if direction == 'BUY' else '🔴 SELL'}\n"
         f"**SETUP STRENGTH:** {confidence}%\n"
-        f"**ENTRY PRICE:** {entry:.5f}\n"
-        f"**STOP LOSS:** {stop_loss:.5f}\n"
-        f"**TAKE PROFIT:** {take_profit:.5f}\n"
+        f"**ENTRY:** {entry:.{decimals}f}\n"
+        f"**STOP LOSS:** {stop_loss:.{decimals}f}\n"
+        f"**TAKE PROFIT:** {take_profit:.{decimals}f}\n"
         f"**SPREAD:** {spread_pips:.2f} pips\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"**ENTRY TIME:** {entry_time}\n"
@@ -457,18 +499,21 @@ def evaluate_signal(pair, now):
         f"**REVIEW:** Reassess after 1 minute\n"
         f"**RISK/REWARD:** 1:2\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"⚠️ Setup score is not a guaranteed win probability. "
+        f"⚠️ Setup strength is not a guaranteed win probability. "
         f"Demo-test before live trading."
     )
 
     if send_discord(message):
         last_alert[alert_key] = time.time()
-        print(f"[SIGNAL SENT] {pair} {direction} {confidence}%", flush=True)
+        print(
+            f"[SIGNAL SENT] {pair} {direction} {confidence}%",
+            flush=True
+        )
 
 
-# =========================================================
+# =====================================================
 # LIVE TICK PROCESSING
-# =========================================================
+# =====================================================
 
 def process_tick(tick):
     try:
@@ -490,16 +535,8 @@ def process_tick(tick):
 
         mid = (bid + ask) / 2
 
-        raw_timestamp = tick.get("timestamp")
-
-        if raw_timestamp is None:
-            timestamp = time.time()
-        else:
-            timestamp = float(raw_timestamp)
-
-            # Convert milliseconds to seconds if needed.
-            if timestamp > 100000000000:
-                timestamp /= 1000
+        # FIX: supports ISO timestamps and numeric timestamps.
+        timestamp = parse_timestamp(tick.get("timestamp"))
 
         with state_lock:
             latest_quotes[symbol] = {
@@ -510,19 +547,18 @@ def process_tick(tick):
             }
 
             tick_counts[symbol] += 1
-            feed_status[symbol] = "LIVE"
 
         trigger = False
 
         for seconds in TIMEFRAMES:
-            completed_15s = update_candle(
+            completed = update_candle(
                 symbol,
                 seconds,
                 mid,
                 timestamp
             )
 
-            if completed_15s:
+            if completed:
                 trigger = True
 
         if trigger:
@@ -530,6 +566,7 @@ def process_tick(tick):
 
     except Exception as error:
         print("[TICK PROCESSING ERROR]", error, flush=True)
+        traceback.print_exc()
 
 
 def flatten_ticks(data):
@@ -538,46 +575,69 @@ def flatten_ticks(data):
             yield from flatten_ticks(item)
 
     elif isinstance(data, dict):
-        if "ticks" in data and isinstance(data["ticks"], list):
+        if isinstance(data.get("ticks"), list):
             yield from flatten_ticks(data["ticks"])
         else:
             yield data
 
 
-def receive_tick(data):
+# =====================================================
+# ASYNC SIGNALR CALLBACKS
+# =====================================================
+
+# FIX: SignalR expects awaitable callback handlers.
+async def receive_tick(data):
     try:
         for tick in flatten_ticks(data):
             process_tick(tick)
+
     except Exception as error:
         print("[RECEIVE TICK ERROR]", error, flush=True)
+        traceback.print_exc()
 
 
-def receive_state(data):
+async def receive_state(data):
     print("[SUBSCRIPTION STATUS]", data, flush=True)
 
 
-# =========================================================
-# MARKET FEED CONNECTION
-# =========================================================
+async def on_feed_open(client):
+    print("[FEED] Connected. Subscribing to pairs...", flush=True)
+
+    await client.send("Subscribe", [PAIRS])
+
+    print("[FEED] Subscription request sent.", flush=True)
+
+
+# =====================================================
+# LIVE MARKET CONNECTION
+# =====================================================
 
 async def run_market_feed():
     while True:
         try:
-            print("[FEED] Connecting to Biquote live market feed...", flush=True)
+            print(
+                "[FEED] Connecting to Biquote live market feed...",
+                flush=True
+            )
 
             client = SignalRClient(BIQUOTE_HUB)
 
             client.on("ReceiveTick", receive_tick)
             client.on("ReceiveSubscriptionState", receive_state)
 
-            client.on_open(
-                lambda: client.send("Subscribe", [PAIRS])
-            )
+            async def opened():
+                await on_feed_open(client)
 
-            print("[FEED] SignalR client starting...", flush=True)
+            client.on_open(opened)
+
+            print("[FEED] Starting SignalR client...", flush=True)
+
             await client.run()
 
-            print("[FEED] Connection ended. Reconnecting...", flush=True)
+            print(
+                "[FEED] Connection ended. Reconnecting in 10 seconds...",
+                flush=True
+            )
 
         except Exception as error:
             print("[FEED CONNECTION ERROR]", error, flush=True)
@@ -586,14 +646,17 @@ async def run_market_feed():
         await asyncio.sleep(10)
 
 
-# =========================================================
-# MONITOR
-# =========================================================
+# =====================================================
+# FEED MONITOR
+# =====================================================
 
 def feed_monitor():
     while True:
         try:
-            print("\n========== BRIGHT HEART FEED MONITOR ==========", flush=True)
+            print(
+                "\n========== BRIGHT HEART FEED MONITOR ==========",
+                flush=True
+            )
 
             for pair in PAIRS:
                 state, age = get_feed_state(pair)
@@ -631,9 +694,9 @@ def feed_monitor():
         time.sleep(60)
 
 
-# =========================================================
+# =====================================================
 # WEB DASHBOARD
-# =========================================================
+# =====================================================
 
 @app.route("/")
 def home():
@@ -734,55 +797,13 @@ def start_web_server():
     )
 
 
-# =========================================================
+# =====================================================
 # MAIN
-# =========================================================
+# =====================================================
 
 async def main():
     print("\n==========================================", flush=True)
     print("       BRIGHT HEART AI - LIVE FOREX", flush=True)
     print("==========================================", flush=True)
     print("PAIRS:", ", ".join(PAIRS), flush=True)
-    print("TIMEFRAMES: 15s | 30s | 1m", flush=True)
-    print("EMA: 9 / 21", flush=True)
-    print("FEED MONITOR: ENABLED", flush=True)
-    print("GAP RECOVERY: ENABLED", flush=True)
-    print(
-        "DISCORD:",
-        "CONFIGURED" if WEBHOOK_URL else "NOT CONFIGURED",
-        flush=True
-    )
-    print("==========================================\n", flush=True)
-
-    discord_startup_test()
-
-    threading.Thread(
-        target=feed_monitor,
-        daemon=True
-    ).start()
-
-    try:
-        await asyncio.to_thread(seed_historical_1m)
-    except Exception as error:
-        print("[HISTORY STARTUP ERROR]", error, flush=True)
-
-    await run_market_feed()
-
-
-if __name__ == "__main__":
-    try:
-        threading.Thread(
-            target=start_web_server,
-            daemon=True
-        ).start()
-
-        asyncio.run(main())
-
-    except KeyboardInterrupt:
-        print("[SYSTEM] Stopped.", flush=True)
-
-    except Exception as error:
-        print("[FATAL APPLICATION ERROR]", error, flush=True)
-        traceback.print_exc()
-        raise
-    
+    print("TIMEFRAMES: 15s 
