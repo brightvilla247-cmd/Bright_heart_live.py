@@ -13,7 +13,7 @@ from waitress import serve
 from pysignalr.client import SignalRClient
 
 # ==========================================
-# BRIGHT HEART AI - UPGRADED RENDER VERSION
+# BRIGHT HEART AI - LIVE CLOUD ENGINE
 # ==========================================
 
 APP_NAME = "BRIGHT HEART AI"
@@ -31,85 +31,12 @@ MIN_CONFIDENCE = 70
 ALERT_COOLDOWN_SECONDS = 300
 MIN_CANDLES = 22
 
+LIVE_MAX_AGE = 5
+STALE_MAX_AGE = 15
+MONITOR_INTERVAL = 60
+
 WAT = pytz.timezone("Africa/Lagos")
 BIQUOTE_URL = "https://biquote.io"
-
-# ==========================================
-# RENDER HEALTH SERVER
-# ==========================================
-
-app = Flask(__name__)
-
-@app.route("/")
-def home():
-    return jsonify({
-        "service": APP_NAME,
-        "status": "running",
-        "market_feed": "Biquote SignalR",
-        "historical_data": "Biquote OHLC 1m",
-        "pairs": PAIRS,
-        "timeframes": ["15s", "30s", "1m"]
-    })
-
-
-@app.route("/health")
-def health():
-    return jsonify({
-        "status": "healthy",
-        "service": APP_NAME
-    })
-
-
-@app.route("/status")
-def status():
-    result = {}
-
-    for pair in PAIRS:
-        result[pair] = {}
-
-        for seconds in TIMEFRAMES:
-            candles = history[pair][seconds]
-
-            result[pair][f"{seconds}s" if seconds < 60 else "1m"] = {
-                "candles": len(candles),
-                "required": MIN_CANDLES,
-                "ready": len(candles) >= MIN_CANDLES
-            }
-
-        quote = latest_quotes.get(pair)
-
-        result[pair]["quote_age_seconds"] = (
-            round(time.time() - quote["received"], 1)
-            if quote else None
-        )
-
-    return jsonify({
-        "service": APP_NAME,
-        "status": "running",
-        "pairs": result
-    })
-
-
-@app.route("/ready")
-def readiness():
-    all_ready = True
-
-    for pair in PAIRS:
-        for seconds in TIMEFRAMES:
-            if len(history[pair][seconds]) < MIN_CANDLES:
-                all_ready = False
-
-    return jsonify({
-        "ready_for_analysis": all_ready,
-        "minimum_candles_per_timeframe": MIN_CANDLES
-    })
-
-
-def start_web_server():
-    port = int(os.environ.get("PORT", 10000))
-    print("Starting health server on port", port)
-    serve(app, host="0.0.0.0", port=port)
-
 
 # ==========================================
 # MARKET DATA STORAGE
@@ -127,6 +54,148 @@ current_candles = {}
 latest_quotes = {}
 last_alert = {}
 last_diagnostic = {}
+
+tick_counts = {pair: 0 for pair in PAIRS}
+feed_status = {pair: "WAITING" for pair in PAIRS}
+
+# ==========================================
+# RENDER HEALTH SERVER
+# ==========================================
+
+app = Flask(__name__)
+
+
+@app.route("/")
+def home():
+    return jsonify({
+        "service": APP_NAME,
+        "status": "running",
+        "market_feed": "Biquote SignalR",
+        "historical_data": "Biquote 1m OHLC",
+        "pairs": PAIRS,
+        "timeframes": ["15s", "30s", "1m"]
+    })
+
+
+@app.route("/health")
+def health():
+    return jsonify({
+        "status": "healthy",
+        "service": APP_NAME
+    })
+
+
+def get_feed_state(pair):
+    quote = latest_quotes.get(pair)
+
+    if not quote:
+        return "WAITING", None
+
+    age = time.time() - quote["received"]
+
+    if age <= LIVE_MAX_AGE:
+        return "LIVE", round(age, 1)
+
+    if age <= STALE_MAX_AGE:
+        return "DELAYED", round(age, 1)
+
+    return "STALE", round(age, 1)
+
+
+@app.route("/status")
+def status():
+    result = {}
+
+    for pair in PAIRS:
+        state, age = get_feed_state(pair)
+        feed_status[pair] = state
+
+        result[pair] = {
+            "feed": state,
+            "quote_age_seconds": age,
+            "ticks_received": tick_counts[pair],
+            "candles": {
+                "15s": len(history[pair][15]),
+                "30s": len(history[pair][30]),
+                "1m": len(history[pair][60])
+            },
+            "ready": (
+                state == "LIVE"
+                and all(
+                    len(history[pair][seconds]) >= MIN_CANDLES
+                    for seconds in TIMEFRAMES
+                )
+            )
+        }
+
+    return jsonify({
+        "service": APP_NAME,
+        "status": "running",
+        "pairs": result
+    })
+
+
+@app.route("/ready")
+def readiness():
+    result = {}
+
+    for pair in PAIRS:
+        state, age = get_feed_state(pair)
+
+        candles_ready = all(
+            len(history[pair][seconds]) >= MIN_CANDLES
+            for seconds in TIMEFRAMES
+        )
+
+        result[pair] = {
+            "feed": state,
+            "candles_ready": candles_ready,
+            "signal_ready": state == "LIVE" and candles_ready
+        }
+
+    return jsonify({
+        "service": APP_NAME,
+        "pairs": result
+    })
+
+
+def start_web_server():
+    port = int(os.environ.get("PORT", 10000))
+    print("Starting health server on port", port)
+    serve(app, host="0.0.0.0", port=port)
+
+
+# ==========================================
+# LIVE FEED MONITOR
+# ==========================================
+
+def feed_monitor():
+    while True:
+        try:
+            print("\n========== LIVE FEED MONITOR ==========")
+
+            for pair in PAIRS:
+                state, age = get_feed_state(pair)
+
+                feed_status[pair] = state
+
+                if age is None:
+                    age_text = "NO QUOTE"
+                else:
+                    age_text = f"{age}s"
+
+                print(
+                    f"{pair}: {state} | "
+                    f"QUOTE AGE: {age_text} | "
+                    f"TICKS: {tick_counts[pair]}"
+                )
+
+            print("=======================================\n")
+
+        except Exception as error:
+            print("FEED MONITOR ERROR:", error)
+
+        time.sleep(MONITOR_INTERVAL)
 
 
 # ==========================================
@@ -182,20 +251,17 @@ def diagnostic(pair, reason):
     key = (pair, reason)
     now = time.time()
 
-    # Avoid flooding Render logs
     if now - last_diagnostic.get(key, 0) >= 60:
         print(f"[DIAGNOSTIC] {pair}: {reason}")
         last_diagnostic[key] = now
 
 
 # ==========================================
-# HISTORICAL ONE-MINUTE CANDLES
+# HISTORICAL ONE-MINUTE DATA
 # ==========================================
 
 def seed_historical_1m():
-    print("===================================")
-    print("LOADING BIQUOTE HISTORICAL 1M DATA")
-    print("===================================")
+    print("\n========== HISTORICAL DATA ==========")
 
     for pair in PAIRS:
         try:
@@ -212,7 +278,6 @@ def seed_historical_1m():
             data = response.json()
 
             bars = data.get("bars", [])
-
             closed_bars = []
 
             for bar in bars:
@@ -233,7 +298,9 @@ def seed_historical_1m():
 
                 closed_bars.append(candle)
 
-            closed_bars.sort(key=lambda item: item["start"])
+            closed_bars.sort(
+                key=lambda item: item["start"]
+            )
 
             history[pair][60].clear()
 
@@ -242,7 +309,8 @@ def seed_historical_1m():
 
             print(
                 f"{pair}: LOADED "
-                f"{len(history[pair][60])} CLOSED 1M CANDLES"
+                f"{len(history[pair][60])} "
+                f"CLOSED 1M CANDLES"
             )
 
         except Exception as error:
@@ -252,6 +320,7 @@ def seed_historical_1m():
             )
 
     print("HISTORICAL DATA LOADING FINISHED")
+    print("====================================\n")
 
 
 # ==========================================
@@ -329,11 +398,10 @@ def evaluate_signal(pair, now):
         diagnostic(pair, "WAIT - NO LIVE QUOTE")
         return
 
-    # Reject stale live quotes
     quote_age = time.time() - quote["received"]
 
-    if quote_age > 15:
-        diagnostic(pair, "WAIT - LIVE QUOTE TOO OLD")
+    if quote_age > STALE_MAX_AGE:
+        diagnostic(pair, "WAIT - STALE PRICE")
         return
 
     bid = quote["bid"]
@@ -356,9 +424,8 @@ def evaluate_signal(pair, now):
         diagnostic(pair, "WAIT - COLLECTING REQUIRED CANDLES")
         return
 
-    # Check completed candle freshness
+    # Verify candle freshness
     for seconds, analysis in analyses.items():
-
         candle_close = analysis["time"] + seconds
         age = now.timestamp() - candle_close
 
@@ -394,7 +461,7 @@ def evaluate_signal(pair, now):
 
     direction = "BUY" if buy_conditions else "SELL"
 
-    # Setup strength score, NOT win probability
+    # Setup strength is NOT win probability
     separations = [
         abs(a["fast"] - a["slow"]) / pip
         for a in analyses.values()
@@ -420,8 +487,7 @@ def evaluate_signal(pair, now):
         diagnostic(pair, "WAIT - ALERT COOLDOWN")
         return
 
-    one_minute_candles = list(history[pair][60])
-    atr = calculate_atr(one_minute_candles)
+    atr = calculate_atr(list(history[pair][60]))
 
     if atr is None or atr <= 0:
         diagnostic(pair, "WAIT - ATR NOT READY")
@@ -481,7 +547,6 @@ def parse_timestamp(value):
 
 
 def process_tick(tick):
-
     try:
         pair = tick["symbol"]
 
@@ -497,14 +562,17 @@ def process_tick(tick):
         if bid <= 0 or ask < bid:
             return
 
+        received = time.time()
+
         latest_quotes[pair] = {
             "bid": bid,
             "ask": ask,
             "mid": mid,
-            "received": time.time()
+            "received": received
         }
 
-        closed_15s = False
+        tick_counts[pair] += 1
+        feed_status[pair] = "LIVE"
 
         for seconds in TIMEFRAMES:
 
@@ -516,7 +584,6 @@ def process_tick(tick):
             candle = current_candles.get(key)
 
             if candle is None:
-
                 current_candles[key] = {
                     "start": bucket,
                     "open": mid,
@@ -524,35 +591,32 @@ def process_tick(tick):
                     "low": mid,
                     "close": mid
                 }
-
                 continue
 
             if bucket < candle["start"]:
-                # Ignore out-of-order ticks
+                # Ignore out-of-order tick
                 continue
 
             if bucket == candle["start"]:
-
                 candle["high"] = max(candle["high"], mid)
                 candle["low"] = min(candle["low"], mid)
                 candle["close"] = mid
 
             elif bucket > candle["start"]:
 
-                # Append only a normally completed candle.
-                # Never treat a candle with a missing interval
-                # as a fully completed candle.
-                if bucket == candle["start"] + seconds:
+                expected_next = candle["start"] + seconds
 
+                if bucket == expected_next:
+                    # Normal completed candle
                     history[pair][seconds].append(candle)
 
-                    if seconds == 15:
-                        closed_15s = True
-
                 else:
+                    # GAP RECOVERY:
+                    # Do not invent missing prices.
+                    # Discard incomplete candle and restart.
                     diagnostic(
                         pair,
-                        f"{seconds}s CANDLE GAP - RESETTING"
+                        f"{seconds}s CANDLE GAP - RECOVERING"
                     )
 
                 current_candles[key] = {
@@ -563,9 +627,8 @@ def process_tick(tick):
                     "close": mid
                 }
 
-        # Evaluate only after a completed 15-second candle
-        if closed_15s:
-            evaluate_signal(pair, timestamp)
+                if seconds == 15 and bucket == expected_next:
+                    evaluate_signal(pair, timestamp)
 
     except Exception as error:
         print("TICK PROCESSING ERROR:", error)
@@ -576,7 +639,6 @@ def process_tick(tick):
 # ==========================================
 
 def flatten_ticks(data):
-
     if isinstance(data, dict):
         return [data]
 
@@ -592,7 +654,6 @@ def flatten_ticks(data):
 
 
 async def receive_tick(data):
-
     for tick in flatten_ticks(data):
         process_tick(tick)
 
@@ -608,9 +669,7 @@ async def receive_state(data):
 async def run_market_feed():
 
     while True:
-
         try:
-
             print("Connecting to Biquote live market feed...")
 
             client = SignalRClient(
@@ -633,9 +692,9 @@ async def run_market_feed():
             print("Market connection ended. Reconnecting...")
 
         except Exception as error:
-
             print("MARKET CONNECTION ERROR:", error)
 
+        print("RECONNECTING IN 10 SECONDS...")
         await asyncio.sleep(10)
 
 
@@ -651,27 +710,32 @@ async def main():
     print("TIMEFRAMES: 15s | 30s | 1m")
     print("STRATEGY: EMA 9/21")
     print("HISTORICAL: BIQUOTE 1M OHLC")
+    print("FEED MONITOR: ENABLED")
+    print("GAP RECOVERY: ENABLED")
     print("DISCORD:", "CONFIGURED" if WEBHOOK_URL else "NOT CONFIGURED")
     print("OTC: NOT ENABLED")
     print("===================================")
 
-    # Preload historical one-minute candles
+    # Start live feed monitor
+    threading.Thread(
+        target=feed_monitor,
+        daemon=True
+    ).start()
+
+    # Load historical one-minute candles
     await asyncio.to_thread(seed_historical_1m)
 
     print("Starting live market analysis...")
-    print("15s and 30s candles will build from live ticks.")
+    print("15s and 30s candles build from live ticks.")
 
     await run_market_feed()
 
 
 if __name__ == "__main__":
 
-    web_thread = threading.Thread(
+    threading.Thread(
         target=start_web_server,
         daemon=True
-    )
-
-    web_thread.start()
+    ).start()
 
     asyncio.run(main())
-        
