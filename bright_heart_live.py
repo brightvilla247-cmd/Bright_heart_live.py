@@ -15,7 +15,7 @@ from pysignalr.client import SignalRClient
 
 
 # =====================================================
-# BRIGHT HEART AI - LIVE FOREX SIGNALS
+# BRIGHT HEART AI - CONFIGURATION
 # =====================================================
 
 APP_NAME = "BRIGHT HEART AI"
@@ -29,6 +29,7 @@ TIMEFRAMES = [15, 30, 60]
 
 EMA_FAST = 9
 EMA_SLOW = 21
+
 MAX_SPREAD_PIPS = 2.0
 MIN_CONFIDENCE = 70
 ALERT_COOLDOWN_SECONDS = 300
@@ -40,6 +41,10 @@ STALE_MAX_AGE = 15
 WAT = pytz.timezone("Africa/Lagos")
 
 app = Flask(__name__)
+
+# =====================================================
+# GLOBAL STATE
+# =====================================================
 
 history = {
     pair: {
@@ -62,7 +67,7 @@ discord_status = {
     "last_error": None
 }
 
-state_lock = threading.Lock()
+state_lock = threading.RLock()
 
 
 # =====================================================
@@ -75,38 +80,35 @@ def wat_now():
 
 def parse_timestamp(value):
     """
-    Supports:
-    - Unix seconds
-    - Unix milliseconds
-    - ISO timestamps such as 2026-11-16T22:58:01Z
+    Accepts Unix seconds, Unix milliseconds,
+    and ISO timestamps such as:
+    2026-11-16T22:58:01Z
     """
 
     if value is None or value == "":
         return time.time()
 
     if isinstance(value, (int, float)):
-        timestamp = float(value)
+        result = float(value)
 
-        if timestamp > 100000000000:
-            timestamp /= 1000
+        if result > 100000000000:
+            result /= 1000
 
-        return timestamp
+        return result
 
     value = str(value).strip()
 
-    # First try numeric timestamp.
     try:
-        timestamp = float(value)
+        result = float(value)
 
-        if timestamp > 100000000000:
-            timestamp /= 1000
+        if result > 100000000000:
+            result /= 1000
 
-        return timestamp
+        return result
 
     except ValueError:
         pass
 
-    # Then try ISO date/time.
     try:
         iso_value = value.replace("Z", "+00:00")
         parsed = datetime.fromisoformat(iso_value)
@@ -118,7 +120,7 @@ def parse_timestamp(value):
 
     except Exception as error:
         print(
-            f"[TIMESTAMP ERROR] Invalid timestamp {value!r}: {error}",
+            f"[TIMESTAMP ERROR] {value!r}: {error}",
             flush=True
         )
         return time.time()
@@ -129,7 +131,8 @@ def pip_size(pair):
 
 
 def get_feed_state(pair):
-    quote = latest_quotes.get(pair)
+    with state_lock:
+        quote = latest_quotes.get(pair)
 
     if not quote:
         return "WAITING", None
@@ -182,6 +185,7 @@ def send_discord(message):
 
         error = f"HTTP {response.status_code}: {response.text[:250]}"
         discord_status["last_error"] = error
+
         print("[DISCORD ERROR]", error, flush=True)
         return False
 
@@ -193,12 +197,12 @@ def send_discord(message):
 
 def discord_startup_test():
     if not WEBHOOK_URL:
-        print("[DISCORD] Not configured.", flush=True)
+        print("[DISCORD] NOT CONFIGURED", flush=True)
         return
 
     send_discord(
         "🟢 **BRIGHT HEART AI ONLINE**\n"
-        "Live forex signal service has started.\n"
+        "Forex signal service has started.\n"
         "Pairs: EURUSD, GBPUSD, USDJPY, AUDUSD, USDCAD\n"
         "Timeframes: 15s | 30s | 1m"
     )
@@ -246,7 +250,7 @@ def calculate_atr(candles, period=14):
 
 
 # =====================================================
-# HISTORICAL CANDLES
+# HISTORICAL 1-MINUTE CANDLES
 # =====================================================
 
 def seed_historical_1m():
@@ -289,6 +293,7 @@ def seed_historical_1m():
 
         except Exception as error:
             print(f"[HISTORY ERROR] {pair}: {error}", flush=True)
+            traceback.print_exc()
 
 
 # =====================================================
@@ -329,6 +334,7 @@ def update_candle(pair, seconds, price, timestamp):
             "close": price
         }
 
+        # Never create artificial candles for missing periods.
         if bucket - completed["time"] != seconds:
             diagnostic(pair, f"{seconds}s candle gap detected")
             return False
@@ -339,7 +345,7 @@ def update_candle(pair, seconds, price, timestamp):
 
 
 # =====================================================
-# ANALYSIS
+# MARKET ANALYSIS
 # =====================================================
 
 def get_analysis(pair, seconds):
@@ -369,8 +375,13 @@ def get_analysis(pair, seconds):
     }
 
 
+# =====================================================
+# SIGNAL ENGINE
+# =====================================================
+
 def evaluate_signal(pair, now):
-    quote = latest_quotes.get(pair)
+    with state_lock:
+        quote = latest_quotes.get(pair)
 
     if not quote:
         diagnostic(pair, "Waiting for quote")
@@ -404,8 +415,8 @@ def evaluate_signal(pair, now):
 
         candle_age = now - (analysis["time"] + seconds)
 
-        if candle_age > seconds * 2:
-            diagnostic(pair, f"{seconds}s candle is too old")
+        if candle_age < -seconds or candle_age > seconds * 2:
+            diagnostic(pair, f"{seconds}s candle time invalid or stale")
             return
 
         analyses[seconds] = analysis
@@ -437,7 +448,7 @@ def evaluate_signal(pair, now):
     elif sell_alignment:
         direction = "SELL"
     else:
-        diagnostic(pair, "Timeframe confirmation not aligned")
+        diagnostic(pair, "EMA/timeframe confirmation not aligned")
         return
 
     separations = [
@@ -445,7 +456,7 @@ def evaluate_signal(pair, now):
         for a in analyses.values()
     ]
 
-    # Setup-strength estimate, NOT win probability.
+    # Setup-strength score, not a measured win probability.
     confidence = min(
         90,
         70 + int(min(10, sum(separations) / 3 * 2))
@@ -478,9 +489,8 @@ def evaluate_signal(pair, now):
         stop_loss = entry + risk_distance
         take_profit = entry - risk_distance * 2
 
-    entry_time = wat_now().strftime("%Y-%m-%d %H:%M:%S WAT")
-
     decimals = 3 if "JPY" in pair else 5
+    entry_time = wat_now().strftime("%Y-%m-%d %H:%M:%S WAT")
 
     message = (
         f"📊 **{APP_NAME} - FOREX SIGNAL**\n"
@@ -535,8 +545,13 @@ def process_tick(tick):
 
         mid = (bid + ask) / 2
 
-        # FIX: supports ISO timestamps and numeric timestamps.
-        timestamp = parse_timestamp(tick.get("timestamp"))
+        # FIX: parse ISO timestamps instead of calling float() on them.
+        raw_timestamp = tick.get(
+            "timestamp",
+            tick.get("time", tick.get("ts"))
+        )
+
+        timestamp = parse_timestamp(raw_timestamp)
 
         with state_lock:
             latest_quotes[symbol] = {
@@ -585,7 +600,6 @@ def flatten_ticks(data):
 # ASYNC SIGNALR CALLBACKS
 # =====================================================
 
-# FIX: SignalR expects awaitable callback handlers.
 async def receive_tick(data):
     try:
         for tick in flatten_ticks(data):
@@ -598,14 +612,6 @@ async def receive_tick(data):
 
 async def receive_state(data):
     print("[SUBSCRIPTION STATUS]", data, flush=True)
-
-
-async def on_feed_open(client):
-    print("[FEED] Connected. Subscribing to pairs...", flush=True)
-
-    await client.send("Subscribe", [PAIRS])
-
-    print("[FEED] Subscription request sent.", flush=True)
 
 
 # =====================================================
@@ -625,10 +631,20 @@ async def run_market_feed():
             client.on("ReceiveTick", receive_tick)
             client.on("ReceiveSubscriptionState", receive_state)
 
-            async def opened():
-                await on_feed_open(client)
+            async def on_open():
+                print(
+                    "[FEED] Connected. Subscribing to pairs...",
+                    flush=True
+                )
 
-            client.on_open(opened)
+                await client.send("Subscribe", [PAIRS])
+
+                print(
+                    "[FEED] Subscription request sent.",
+                    flush=True
+                )
+
+            client.on_open(on_open)
 
             print("[FEED] Starting SignalR client...", flush=True)
 
@@ -686,7 +702,10 @@ def feed_monitor():
                 flush=True
             )
 
-            print("================================================\n", flush=True)
+            print(
+                "================================================\n",
+                flush=True
+            )
 
         except Exception as error:
             print("[MONITOR ERROR]", error, flush=True)
@@ -787,23 +806,4 @@ def discord_test():
 def start_web_server():
     port = int(os.environ.get("PORT", 10000))
 
-    print(f"[WEB] Starting server on port {port}", flush=True)
-
-    serve(
-        app,
-        host="0.0.0.0",
-        port=port,
-        threads=4
-    )
-
-
-# =====================================================
-# MAIN
-# =====================================================
-
-async def main():
-    print("\n==========================================", flush=True)
-    print("       BRIGHT HEART AI - LIVE FOREX", flush=True)
-    print("==========================================", flush=True)
-    print("PAIRS:", ", ".join(PAIRS), flush=True)
-    print("TIMEFRAMES: 15s 
+    print(f"[WEB] Starting server on 
